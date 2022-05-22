@@ -22,13 +22,10 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.KafkaSourceBuilder;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema;
 import org.apache.flink.streaming.connectors.kafka.config.StartupMode;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartition;
@@ -36,9 +33,9 @@ import org.apache.flink.streaming.connectors.kafka.table.DynamicKafkaDeserializa
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.format.DecodingFormat;
-import org.apache.flink.table.connector.source.DataStreamScanProvider;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.ScanTableSource;
+import org.apache.flink.table.connector.source.SourceProvider;
 import org.apache.flink.table.connector.source.abilities.SupportsReadingMetadata;
 import org.apache.flink.table.connector.source.abilities.SupportsWatermarkPushDown;
 import org.apache.flink.table.data.GenericMapData;
@@ -146,6 +143,8 @@ public class KafkaDynamicSource
 
     protected final String tableIdentifier;
 
+    protected final Integer scanParallelism;
+
     public KafkaDynamicSource(
             DataType physicalDataType,
             @Nullable DecodingFormat<DeserializationSchema<RowData>> keyDecodingFormat,
@@ -160,7 +159,8 @@ public class KafkaDynamicSource
             Map<KafkaTopicPartition, Long> specificStartupOffsets,
             long startupTimestampMillis,
             boolean upsertMode,
-            String tableIdentifier) {
+            String tableIdentifier,
+            @Nullable Integer scanParallelism) {
         // Format attributes
         this.physicalDataType =
                 Preconditions.checkNotNull(
@@ -194,6 +194,7 @@ public class KafkaDynamicSource
         this.startupTimestampMillis = startupTimestampMillis;
         this.upsertMode = upsertMode;
         this.tableIdentifier = tableIdentifier;
+        this.scanParallelism = scanParallelism;
     }
 
     @Override
@@ -215,21 +216,7 @@ public class KafkaDynamicSource
         final KafkaSource<RowData> kafkaSource =
                 createKafkaSource(keyDeserialization, valueDeserialization, producedTypeInfo);
 
-        return new DataStreamScanProvider() {
-            @Override
-            public DataStream<RowData> produceDataStream(StreamExecutionEnvironment execEnv) {
-                if (watermarkStrategy == null) {
-                    watermarkStrategy = WatermarkStrategy.noWatermarks();
-                }
-                return execEnv.fromSource(
-                        kafkaSource, watermarkStrategy, "KafkaSource-" + tableIdentifier);
-            }
-
-            @Override
-            public boolean isBounded() {
-                return kafkaSource.getBoundedness() == Boundedness.BOUNDED;
-            }
-        };
+        return null == scanParallelism ? SourceProvider.of(kafkaSource) : SourceProvider.of(kafkaSource, scanParallelism);
     }
 
     @Override
@@ -303,7 +290,8 @@ public class KafkaDynamicSource
                         specificStartupOffsets,
                         startupTimestampMillis,
                         upsertMode,
-                        tableIdentifier);
+                        tableIdentifier,
+                        scanParallelism);
         copy.producedDataType = producedDataType;
         copy.metadataKeys = metadataKeys;
         copy.watermarkStrategy = watermarkStrategy;
