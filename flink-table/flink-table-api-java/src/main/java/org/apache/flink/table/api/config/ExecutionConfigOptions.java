@@ -376,6 +376,14 @@ public class ExecutionConfigOptions {
                                                     + "Pipelined shuffle means data will be sent to consumer tasks once produced.")
                                     .build());
 
+    @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
+    public static final ConfigOption<Boolean> TABLE_EXEC_SOURCE_FORCE_BREAK_CHAIN =
+            key("table.exec.source.force-break-chain")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Indicates whether to forcefully break the operator chain after the source.");
+
     // ------------------------------------------------------------------------------------------
     // Enum option types
     // ------------------------------------------------------------------------------------------

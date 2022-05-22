@@ -907,7 +907,8 @@ public class KafkaDynamicTableFactoryTest extends TestLogger {
                 specificStartupOffsets,
                 startupTimestampMillis,
                 false,
-                FactoryMocks.IDENTIFIER.asSummaryString());
+                FactoryMocks.IDENTIFIER.asSummaryString(),
+                null);
     }
 
     private static KafkaDynamicSink createExpectedSink(

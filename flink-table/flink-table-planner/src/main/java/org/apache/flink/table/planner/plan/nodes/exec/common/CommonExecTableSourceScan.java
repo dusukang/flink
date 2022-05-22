@@ -24,11 +24,16 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.Source;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.source.ParallelSourceFunction;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.streaming.api.operators.StreamSource;
 import org.apache.flink.streaming.api.transformations.LegacySourceTransformation;
+import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.api.config.ExecutionConfigOptions;
+import org.apache.flink.table.connector.ParallelismProvider;
 import org.apache.flink.table.connector.source.DataStreamScanProvider;
 import org.apache.flink.table.connector.source.InputFormatProvider;
 import org.apache.flink.table.connector.source.ScanTableSource;
@@ -49,6 +54,7 @@ import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.util.Collections;
+import java.util.Optional;
 
 /**
  * Base {@link ExecNode} to read data from an external source defined by a {@link ScanTableSource}.
@@ -98,9 +104,18 @@ public abstract class CommonExecTableSourceScan extends ExecNodeBase<RowData>
         } else if (provider instanceof SourceProvider) {
             Source<RowData, ?, ?> source = ((SourceProvider) provider).createSource();
             // TODO: Push down watermark strategy to source scan
-            return env.fromSource(
-                            source, WatermarkStrategy.noWatermarks(), operatorName, outputTypeInfo)
-                    .getTransformation();
+            DataStreamSource<RowData> rowDataStreamSource = env.fromSource(
+                    source, WatermarkStrategy.noWatermarks(), operatorName, outputTypeInfo);
+            final Configuration config = planner.getTableConfig().getConfiguration();
+            if (config.get(ExecutionConfigOptions.TABLE_EXEC_SOURCE_FORCE_BREAK_CHAIN)) {
+                rowDataStreamSource.disableChaining();
+            }
+            int confParallelism = rowDataStreamSource.getParallelism();
+            final int scanParallelism = deriveSourceParallelism(
+                    (ParallelismProvider) provider, confParallelism);
+            Transformation<RowData> transformation = rowDataStreamSource.getTransformation();
+            transformation.setParallelism(scanParallelism);
+            return transformation;
         } else if (provider instanceof DataStreamScanProvider) {
             Transformation<RowData> transformation =
                     ((DataStreamScanProvider) provider).produceDataStream(env).getTransformation();
@@ -114,6 +129,25 @@ public abstract class CommonExecTableSourceScan extends ExecNodeBase<RowData>
         } else {
             throw new UnsupportedOperationException(
                     provider.getClass().getSimpleName() + " is unsupported now.");
+        }
+    }
+
+    private int deriveSourceParallelism(
+            ParallelismProvider parallelismProvider, int confParallelism) {
+        final Optional<Integer> parallelismOptional = parallelismProvider.getParallelism();
+        if (parallelismOptional.isPresent()) {
+            int sourceParallelism = parallelismOptional.get();
+            if (sourceParallelism <= 0) {
+                throw new TableException(
+                        String.format(
+                                "Table: %s configured source parallelism: "
+                                        + "%s should not be less than zero or equal to zero",
+                                tableSourceSpec.getObjectIdentifier().asSummaryString(),
+                                sourceParallelism));
+            }
+            return sourceParallelism;
+        } else {
+            return confParallelism;
         }
     }
 
