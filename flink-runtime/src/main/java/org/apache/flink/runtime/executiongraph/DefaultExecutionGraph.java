@@ -96,6 +96,7 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -207,8 +208,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
     private final TaskDeploymentDescriptorFactory.PartitionLocationConstraint
             partitionLocationConstraint;
 
-    /** The maximum number of prior execution attempts kept in history. */
-    private final int maxPriorAttemptsHistoryLength;
+    /** The maximum number of historical execution attempts kept in history. */
+    private final int executionHistorySizeLimit;
 
     // ------ Execution status and progress. These values are volatile, and accessed under the lock
     // -------
@@ -286,6 +287,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
 
     private final boolean isDynamic;
 
+    private final ExecutionJobVertex.Factory executionJobVertexFactory;
+
     // --------------------------------------------------------------------------------------------
     //   Constructors
     // --------------------------------------------------------------------------------------------
@@ -295,7 +298,7 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
             ScheduledExecutorService futureExecutor,
             Executor ioExecutor,
             Time rpcTimeout,
-            int maxPriorAttemptsHistoryLength,
+            int executionHistorySizeLimit,
             ClassLoader userClassLoader,
             BlobWriter blobWriter,
             PartitionGroupReleaseStrategy.Factory partitionGroupReleaseStrategyFactory,
@@ -307,7 +310,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
             long initializationTimestamp,
             VertexAttemptNumberStore initialAttemptCounts,
             VertexParallelismStore vertexParallelismStore,
-            boolean isDynamic)
+            boolean isDynamic,
+            ExecutionJobVertex.Factory executionJobVertexFactory)
             throws IOException {
 
         this.executionGraphId = new ExecutionGraphID();
@@ -346,7 +350,7 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
         this.kvStateLocationRegistry =
                 new KvStateLocationRegistry(jobInformation.getJobId(), getAllVertices());
 
-        this.maxPriorAttemptsHistoryLength = maxPriorAttemptsHistoryLength;
+        this.executionHistorySizeLimit = executionHistorySizeLimit;
 
         this.schedulingFuture = null;
         this.jobMasterMainThreadExecutor =
@@ -374,6 +378,8 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
         this.resultPartitionsById = new HashMap<>();
 
         this.isDynamic = isDynamic;
+
+        this.executionJobVertexFactory = checkNotNull(executionJobVertexFactory);
 
         LOG.info(
                 "Created execution graph {} for job {}.",
@@ -840,7 +846,9 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
                     parallelismStore.getParallelismInfo(jobVertex.getID());
 
             // create the execution job vertex and attach it to the graph
-            ExecutionJobVertex ejv = new ExecutionJobVertex(this, jobVertex, parallelismInfo);
+            ExecutionJobVertex ejv =
+                    executionJobVertexFactory.createExecutionJobVertex(
+                            this, jobVertex, parallelismInfo);
 
             ExecutionJobVertex previousTask = this.tasks.putIfAbsent(jobVertex.getID(), ejv);
             if (previousTask != null) {
@@ -871,7 +879,7 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
         checkNotNull(ejv);
 
         ejv.initialize(
-                maxPriorAttemptsHistoryLength,
+                executionHistorySizeLimit,
                 rpcTimeout,
                 createTimestamp,
                 this.initialAttemptCounts.getAttemptCounts(ejv.getJobVertexId()),
@@ -1161,29 +1169,44 @@ public class DefaultExecutionGraph implements ExecutionGraph, InternalExecutionG
         assertRunningInJobMasterMainThread();
         final int numFinished = ++numFinishedJobVertices;
         if (numFinished == numJobVerticesTotal) {
-            // done :-)
+            FutureUtils.assertNoException(
+                    waitForAllExecutionsTermination().thenAccept(ignored -> jobFinished()));
+        }
+    }
 
-            // check whether we are still in "RUNNING" and trigger the final cleanup
-            if (state == JobStatus.RUNNING) {
-                // we do the final cleanup in the I/O executor, because it may involve
-                // some heavier work
+    private CompletableFuture<?> waitForAllExecutionsTermination() {
+        final List<CompletableFuture<?>> terminationFutures =
+                verticesInCreationOrder.stream()
+                        .flatMap(ejv -> Arrays.stream(ejv.getTaskVertices()))
+                        .map(ExecutionVertex::getTerminationFuture)
+                        .collect(Collectors.toList());
 
-                try {
-                    for (ExecutionJobVertex ejv : verticesInCreationOrder) {
-                        ejv.getJobVertex().finalizeOnMaster(getUserClassLoader());
-                    }
-                } catch (Throwable t) {
-                    ExceptionUtils.rethrowIfFatalError(t);
-                    ClusterEntryPointExceptionUtils.tryEnrichClusterEntryPointError(t);
-                    failGlobal(new Exception("Failed to finalize execution on master", t));
-                    return;
+        return FutureUtils.waitForAll(terminationFutures);
+    }
+
+    private void jobFinished() {
+        assertRunningInJobMasterMainThread();
+
+        // check whether we are still in "RUNNING" and trigger the final cleanup
+        if (state == JobStatus.RUNNING) {
+            // we do the final cleanup in the I/O executor, because it may involve
+            // some heavier work
+
+            try {
+                for (ExecutionJobVertex ejv : verticesInCreationOrder) {
+                    ejv.getJobVertex().finalizeOnMaster(getUserClassLoader());
                 }
+            } catch (Throwable t) {
+                ExceptionUtils.rethrowIfFatalError(t);
+                ClusterEntryPointExceptionUtils.tryEnrichClusterEntryPointError(t);
+                failGlobal(new Exception("Failed to finalize execution on master", t));
+                return;
+            }
 
-                // if we do not make this state transition, then a concurrent
-                // cancellation or failure happened
-                if (transitionState(JobStatus.RUNNING, JobStatus.FINISHED)) {
-                    onTerminalState(JobStatus.FINISHED);
-                }
+            // if we do not make this state transition, then a concurrent
+            // cancellation or failure happened
+            if (transitionState(JobStatus.RUNNING, JobStatus.FINISHED)) {
+                onTerminalState(JobStatus.FINISHED);
             }
         }
     }
